@@ -1,5 +1,7 @@
 # Euraker
 
+> This is heavily vibe coded. Use at your own risk.
+
 Euraker is a standalone, user-friendly scraper for downloading Eureka article pages after manual institutional login.
 
 It is built for reliability: it saves progress during scraping, supports resume, and provides a simple CLI.
