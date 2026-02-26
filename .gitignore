@@ -8,6 +8,7 @@ venv/
 dist/
 build/
 *.egg-info/
+~/
 eureka_articles/
 downloaded_articles/
 *.log

@@ -61,7 +61,7 @@ class EurekaScraper:
         Args:
             output_dir (str): Directory path where downloaded articles will be saved
         """
-        self.output_dir = str(Path(output_dir))
+        self.output_dir = str(Path(output_dir).expanduser().resolve())
         self.driver = None
 
         # Create output directory if it doesn't exist
@@ -1326,7 +1326,9 @@ def main(
         raise ValueError("start_date must be before or equal to end_date.")
 
     # Create a timeframe-specific directory
-    timeframe_dir = os.path.join(output_dir, f"{start_date}_{end_date}")
+    output_root = Path(output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    timeframe_dir = str(output_root / f"{start_date}_{end_date}")
     if not os.path.exists(timeframe_dir):
         os.makedirs(timeframe_dir)
         print(f"Created directory: {timeframe_dir}")
