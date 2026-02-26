@@ -2,8 +2,8 @@
 
 Euraker is a standalone, user-friendly scraper for downloading Eureka article pages after manual institutional login.
 
-It is built for reliability: it saves progress, supports resume, keeps troubleshooting artifacts (screenshots + HTML), and provides a simple CLI.
-After each run, it also creates a consolidated dataset file (default: `articles_dataset.parquet`) ready for R.
+It is built for reliability: it saves progress during scraping, supports resume, and provides a simple CLI.
+After each run, it exports a consolidated dataset (default: parquet) to `~/Downloads` and cleans temporary scrape files.
 
 ## Features
 
@@ -79,6 +79,7 @@ uv run python eureka_scraper.py --start-date 2024-01-01 --end-date 2024-01-31
 - `--workers N` number of parallel workers in requests mode
 - `--interactive` launch guided setup wizard
 - `--export-format {parquet,csv,jsonl}` dataset output format (default: `parquet`)
+- `--export-dir PATH` final dataset destination (default: `~/Downloads`)
 
 ## Performance Tips
 
@@ -95,7 +96,21 @@ uv run python eureka_scraper.py --start-date 2024-01-01 --end-date 2024-01-31
 
 ## Output Layout
 
-For `--output-dir ./eureka_articles --start-date 2024-01-01 --end-date 2024-01-31`:
+During scraping, files are written to `--output-dir`. After export, temporary files are removed.
+
+Default final output location:
+
+```text
+~/Downloads/articles_dataset_2024-01-01_2024-01-31.parquet
+```
+
+If you set a custom export folder:
+
+```bash
+uv run euraker --start-date 2024-01-01 --end-date 2024-01-31 --export-dir ~/data/euraker
+```
+
+Temporary working folder shape (before cleanup):
 
 ```text
 eureka_articles/
@@ -104,7 +119,6 @@ eureka_articles/
     article_0002.html
     ...
     article_urls.csv
-    articles_dataset.parquet
     doc_keys.json
     progress.txt
     *_screenshot.png
@@ -143,12 +157,12 @@ Parquet (recommended):
 
 ```r
 library(arrow)
-df <- read_parquet("eureka_articles/2024-01-01_2024-01-31/articles_dataset.parquet")
+df <- read_parquet("~/Downloads/articles_dataset_2024-01-01_2024-01-31.parquet")
 ```
 
 CSV:
 
 ```r
 library(readr)
-df <- read_csv("eureka_articles/2024-01-01_2024-01-31/articles_dataset.csv")
+df <- read_csv("~/Downloads/articles_dataset_2024-01-01_2024-01-31.csv")
 ```

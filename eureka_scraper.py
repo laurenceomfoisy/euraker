@@ -38,6 +38,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 DEFAULT_START_URL = "https://acces.bibl.ulaval.ca/login?url=https://nouveau.eureka.cc/access/ip/default.aspx?un=ulaval1"
 DEFAULT_OUTPUT_DIR = "./eureka_articles"
+DEFAULT_EXPORT_DIR = "~/Downloads"
 
 
 class EurekaScraper:
@@ -880,13 +881,18 @@ class EurekaScraper:
 
         return pd.DataFrame(records).sort_values("article_index").reset_index(drop=True)
 
-    def export_articles_dataset(self, export_format="parquet"):
+    def export_articles_dataset(
+        self, export_format="parquet", export_dir=DEFAULT_EXPORT_DIR
+    ):
         """Export a consolidated dataset from downloaded HTML files."""
         df = self.build_articles_dataframe()
         if df.empty:
-            return
+            return None
 
-        output_base = Path(self.output_dir) / "articles_dataset"
+        export_root = Path(export_dir).expanduser().resolve()
+        export_root.mkdir(parents=True, exist_ok=True)
+        batch_name = Path(self.output_dir).name
+        output_base = export_root / f"articles_dataset_{batch_name}"
         if export_format == "parquet":
             output_path = output_base.with_suffix(".parquet")
             df.to_parquet(output_path, index=False)
@@ -902,6 +908,38 @@ class EurekaScraper:
             )
 
         print(f"Exported dataset with {len(df)} rows to {output_path}")
+        return output_path
+
+    def cleanup_temporary_files(self, keep_file=None):
+        """Remove temporary scraper files while preserving the final dataset."""
+        output_dir = Path(self.output_dir)
+        keep_resolved = None
+        if keep_file:
+            keep_resolved = Path(keep_file).expanduser().resolve()
+
+        removed_files = 0
+        removed_dirs = 0
+        for path in output_dir.iterdir():
+            try:
+                if keep_resolved and path.resolve() == keep_resolved:
+                    continue
+                if path.is_file() or path.is_symlink():
+                    path.unlink()
+                    removed_files += 1
+                elif path.is_dir():
+                    for sub in sorted(path.rglob("*"), reverse=True):
+                        if sub.is_file() or sub.is_symlink():
+                            sub.unlink()
+                        elif sub.is_dir():
+                            sub.rmdir()
+                    path.rmdir()
+                    removed_dirs += 1
+            except Exception as e:
+                print(f"Could not remove temporary path {path}: {e}")
+
+        print(
+            f"Cleanup complete in {output_dir}: removed {removed_files} files and {removed_dirs} directories"
+        )
 
     def close(self):
         """
@@ -1200,6 +1238,10 @@ def run_interactive_wizard(args):
             break
         print("Choose 1, 2, 3, or one of: parquet, csv, jsonl.")
 
+    export_dir = (
+        input(f"Export directory [{args.export_dir}]: ").strip() or args.export_dir
+    )
+
     print("\nRun configuration:")
     print(f"- start_date: {start_date}")
     print(f"- end_date: {end_date}")
@@ -1209,6 +1251,8 @@ def run_interactive_wizard(args):
     print(f"- workers: {workers}")
     print(f"- batch_size: {batch_size}")
     print(f"- export_format: {export_format}")
+    print(f"- export_dir: {export_dir}")
+    print("- cleanup_temp_files: enabled")
 
     if not prompt_yes_no("Start scraping with this configuration", default=True):
         raise SystemExit("Cancelled by user.")
@@ -1224,6 +1268,7 @@ def run_interactive_wizard(args):
         "mode": mode,
         "workers": workers,
         "export_format": export_format,
+        "export_dir": export_dir,
     }
 
 
@@ -1238,6 +1283,7 @@ def main(
     mode="auto",
     workers=1,
     export_format="parquet",
+    export_dir=DEFAULT_EXPORT_DIR,
 ):
     """
     Main function to run the scraper with configurable parameters.
@@ -1317,7 +1363,12 @@ def main(
         mode=mode,
         workers=workers,
     )
-    scraper.export_articles_dataset(export_format=export_format)
+    exported_path = scraper.export_articles_dataset(
+        export_format=export_format,
+        export_dir=export_dir,
+    )
+    if exported_path:
+        scraper.cleanup_temporary_files(keep_file=exported_path)
 
 
 def build_parser():
@@ -1392,6 +1443,12 @@ def build_parser():
         default="parquet",
         help="Consolidated dataset export format (default: parquet)",
     )
+    parser.add_argument(
+        "--export-dir",
+        type=str,
+        default=DEFAULT_EXPORT_DIR,
+        help=f"Directory for final dataset export (default: {DEFAULT_EXPORT_DIR})",
+    )
     return parser
 
 
@@ -1415,6 +1472,7 @@ def cli():
             "mode": args.mode,
             "workers": max(1, args.workers),
             "export_format": args.export_format,
+            "export_dir": args.export_dir,
         }
 
     main(**config)
