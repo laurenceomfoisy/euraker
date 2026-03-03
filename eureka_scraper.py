@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import pandas as pd
 import requests
@@ -33,6 +33,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
 
@@ -187,8 +188,8 @@ class EurekaScraper:
                     By.XPATH, "//div[contains(@class, 'results-count')]"
                 )
                 print(f"Results indicator found: {results_count.text}")
-            except Exception as e:
-                print(f"Could not find results count: {e}")
+            except Exception:
+                print("Could not find a visible results-count element on this page")
 
             # Get page source
             page_source = self.driver.page_source
@@ -201,58 +202,7 @@ class EurekaScraper:
             ) as f:
                 f.write(page_source)
 
-            # Try different regex patterns to find document keys
-            patterns = [
-                r"_docKeyList\s*=\s*(\[.+?\]);",  # Original pattern
-                r"var\s+_docKeyList\s*=\s*(\[.+?\]);",  # With 'var' declaration
-                r"_docKeyList\s*=\s*(\[.*?\])",  # Without semicolon
-                r"docKeyList\s*=\s*(\[.+?\]);",  # Alternative variable name
-                r"\"docKeys\":\s*(\[.+?\])",  # JSON property pattern
-            ]
-
-            doc_keys = []
-
-            # Try each pattern until we find a match
-            for pattern in patterns:
-                match = re.search(pattern, page_source, re.DOTALL)
-                if match:
-                    json_array = match.group(1)
-
-                    # Clean the JSON string (handle escaped quotes, newlines, etc.)
-                    json_array = json_array.replace('\\"', '"').replace("\\n", "")
-
-                    try:
-                        doc_keys = json.loads(json_array)
-                        print(
-                            f"Found {len(doc_keys)} document keys with pattern: {pattern}"
-                        )
-                        break
-                    except json.JSONDecodeError as e:
-                        print(f"Error parsing JSON array with pattern {pattern}: {e}")
-                        continue
-
-            # Alternative: Try to extract document IDs from links if regex approach fails
-            if not doc_keys:
-                print("Trying alternative extraction method from links...")
-                try:
-                    article_links = self.driver.find_elements(
-                        By.XPATH, "//a[contains(@href, 'docName=')]"
-                    )
-                    for link in article_links:
-                        href = link.get_attribute("href")
-                        match = re.search(r"docName=([^&]+)", href)
-                        if match:
-                            doc_key = match.group(1)
-                            # URL decode the key
-                            doc_key = doc_key.replace("%C2%B7", "·").replace(
-                                "%C3%97", "×"
-                            )
-                            if doc_key not in doc_keys:
-                                doc_keys.append(doc_key)
-
-                    print(f"Found {len(doc_keys)} document keys from links")
-                except Exception as e:
-                    print(f"Error extracting keys from links: {e}")
+            doc_keys = self._extract_doc_keys_all_pages()
 
             # Save doc keys to file for backup (if any found)
             if doc_keys:
@@ -274,6 +224,236 @@ class EurekaScraper:
                 os.path.join(self.output_dir, "doc_keys_error.png")
             )
             return []
+
+    def _extract_doc_keys_from_html(self, page_source):
+        """Extract document keys from page HTML using resilient regex patterns."""
+        patterns = [
+            r"_docKeyList\s*=\s*(\[.+?\]);",
+            r"var\s+_docKeyList\s*=\s*(\[.+?\]);",
+            r"_docKeyList\s*=\s*(\[.*?\])",
+            r"docKeyList\s*=\s*(\[.+?\]);",
+            r'"docKeys":\s*(\[.+?\])',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, page_source, re.DOTALL)
+            if not match:
+                continue
+
+            json_array = match.group(1).replace('\\"', '"').replace("\\n", "")
+            try:
+                parsed_keys = json.loads(json_array)
+                if isinstance(parsed_keys, list):
+                    return [str(key) for key in parsed_keys if str(key).strip()]
+            except json.JSONDecodeError:
+                continue
+
+        return []
+
+    def _extract_doc_keys_from_links(self):
+        """Fallback extractor for keys embedded in result links."""
+        keys = []
+        article_links = self.driver.find_elements(
+            By.XPATH, "//a[contains(@href, 'docName=')]"
+        )
+        for link in article_links:
+            href = link.get_attribute("href") or ""
+            match = re.search(r"docName=([^&]+)", href)
+            if not match:
+                continue
+            keys.append(unquote(match.group(1)))
+        return keys
+
+    def _switch_to_frame_path(self, frame_path):
+        """Switch Selenium context to a nested frame path."""
+        try:
+            self.driver.switch_to.default_content()
+            for index in frame_path:
+                frames = self.driver.find_elements(By.CSS_SELECTOR, "iframe, frame")
+                if index >= len(frames):
+                    return False
+                self.driver.switch_to.frame(frames[index])
+            return True
+        except Exception:
+            return False
+
+    def _collect_frame_paths(self, max_depth=3):
+        """Collect frame paths so extraction can work inside nested iframes."""
+        paths = [tuple()]
+
+        def walk(path, depth):
+            if depth >= max_depth:
+                return
+            if not self._switch_to_frame_path(path):
+                return
+
+            frames = self.driver.find_elements(By.CSS_SELECTOR, "iframe, frame")
+            for index in range(len(frames)):
+                child = path + (index,)
+                paths.append(child)
+                walk(child, depth + 1)
+
+        walk(tuple(), 0)
+        return paths
+
+    def _extract_doc_keys_best_context(self):
+        """Find the frame context that contains the richest set of doc keys."""
+        best_path = tuple()
+        best_keys = []
+
+        for frame_path in self._collect_frame_paths():
+            if not self._switch_to_frame_path(frame_path):
+                continue
+
+            page_source = self.driver.page_source
+            keys = self._extract_doc_keys_from_html(page_source)
+            if not keys:
+                keys = self._extract_doc_keys_from_links()
+
+            if len(keys) > len(best_keys):
+                best_keys = keys
+                best_path = frame_path
+
+        self._switch_to_frame_path(best_path)
+        return best_path, best_keys
+
+    def _find_next_results_button(self):
+        """Return a clickable 'next page' element, or None if not found."""
+        selectors = [
+            "//a[@rel='next']",
+            "//button[@rel='next']",
+            "//li[contains(@class,'next')]/a",
+            "//li[contains(@class,'pagination-next')]/a",
+            "//a[contains(@class,'next')]",
+            "//button[contains(@class,'next')]",
+            "//a[contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next')]",
+            "//a[contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'suivant')]",
+            "//button[contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next')]",
+            "//button[contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'suivant')]",
+            "//a[contains(translate(@title, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next')]",
+            "//a[contains(translate(@title, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'suivant')]",
+            "//button[contains(translate(@title, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next')]",
+            "//button[contains(translate(@title, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'suivant')]",
+            "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next')]",
+            "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'suivant')]",
+            "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next')]",
+            "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'suivant')]",
+            "//a[normalize-space(.)='>' or normalize-space(.)='>>' or normalize-space(.)='›' or normalize-space(.)='»']",
+            "//button[normalize-space(.)='>' or normalize-space(.)='>>' or normalize-space(.)='›' or normalize-space(.)='»']",
+        ]
+
+        for xpath in selectors:
+            candidates = self.driver.find_elements(By.XPATH, xpath)
+            for candidate in candidates:
+                classes = (candidate.get_attribute("class") or "").lower()
+                aria_disabled = (candidate.get_attribute("aria-disabled") or "").lower()
+                disabled_attr = candidate.get_attribute("disabled")
+                if (
+                    "disabled" in classes
+                    or aria_disabled == "true"
+                    or disabled_attr is not None
+                    or not candidate.is_enabled()
+                    or not candidate.is_displayed()
+                ):
+                    continue
+                return candidate
+
+        return None
+
+    def _extract_doc_keys_all_pages(self, max_pages=100):
+        """Extract document keys from current and subsequent result pages."""
+        collected = []
+        seen = set()
+        page_number = 1
+        active_frame_path = None
+
+        while page_number <= max_pages:
+            frame_path, page_keys = self._extract_doc_keys_best_context()
+            if active_frame_path is None:
+                active_frame_path = frame_path
+                if active_frame_path:
+                    print(f"Detected results inside frame path {active_frame_path}")
+
+            new_keys = 0
+            for key in page_keys:
+                if key in seen:
+                    continue
+                seen.add(key)
+                collected.append(key)
+                new_keys += 1
+
+            print(
+                f"Results page {page_number}: found {len(page_keys)} keys ({new_keys} new, {len(collected)} total)"
+            )
+
+            next_button = self._find_next_results_button()
+            if not next_button:
+                if page_number == 1 and len(collected) >= 1000:
+                    print(
+                        "No next-page control detected after 1000 keys. Eureka may be capping this query at 1000 results."
+                    )
+                    print(
+                        "Try a narrower date window (e.g., weekly/monthly chunks) and run multiple scrapes."
+                    )
+                break
+
+            previous_page_source = self.driver.page_source
+            try:
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center'});", next_button
+                )
+                try:
+                    next_button.click()
+                except Exception:
+                    self.driver.execute_script("arguments[0].click();", next_button)
+
+                WebDriverWait(self.driver, 10).until(
+                    lambda d: d.page_source != previous_page_source
+                )
+                time.sleep(0.5)
+
+                if active_frame_path is not None:
+                    self._switch_to_frame_path(active_frame_path)
+                page_number += 1
+            except Exception:
+                print(
+                    "Next page detected, but navigation failed. Stopping key extraction."
+                )
+                break
+
+        if page_number > max_pages:
+            print(f"Reached safety limit of {max_pages} result pages.")
+
+        return collected
+
+    def estimate_total_results(self):
+        """Best-effort parser for total results displayed on the results page."""
+        try:
+            page_source = self.driver.page_source
+        except Exception:
+            return None
+
+        compact = re.sub(r"\s+", " ", page_source)
+        patterns = [
+            r"([0-9][0-9\s\.,]{0,12})\s+(?:results|resultats|résultats)\b",
+            r"(?:results|resultats|résultats)\D{0,20}([0-9][0-9\s\.,]{0,12})",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, compact, re.IGNORECASE)
+            if not match:
+                continue
+            raw = match.group(1)
+            number_text = re.sub(r"[^0-9]", "", raw)
+            if not number_text:
+                continue
+            try:
+                value = int(number_text)
+            except ValueError:
+                continue
+            if value > 0:
+                return value
+
+        return None
 
     def load_saved_doc_keys(self):
         """Load previously extracted document keys, if available."""
@@ -991,11 +1171,35 @@ class EurekaScraper:
 
             # Extract document keys
             doc_keys = self.extract_doc_keys()
+            estimated_total = self.estimate_total_results()
+            if estimated_total:
+                print(f"Estimated total results shown by Eureka: {estimated_total}")
             if not doc_keys:
-                doc_keys = self.load_saved_doc_keys()
+                if start_index > 0:
+                    print(
+                        "No keys detected on the current page. Trying saved doc_keys.json because start_index > 0."
+                    )
+                    doc_keys = self.load_saved_doc_keys()
+
                 if not doc_keys:
-                    print("No document keys found. Exiting.")
+                    print(
+                        "No document keys found on the current results page. Exiting."
+                    )
+                    print(
+                        "Make sure you are on the Eureka search results list (not an article page) before pressing Enter."
+                    )
                     return
+
+            if estimated_total and len(doc_keys) < estimated_total:
+                print(
+                    f"Warning: extracted {len(doc_keys)} keys but results page indicates about {estimated_total} items."
+                )
+                print(
+                    "This usually means Eureka applies a 1000-item retrieval cap per query."
+                )
+                print(
+                    "Recommended: split your search into smaller date windows (for example weekly/monthly) so each query returns < 1000 results."
+                )
 
             # Create URLs for articles
             urls = self.create_article_urls(doc_keys)

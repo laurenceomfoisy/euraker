@@ -168,3 +168,17 @@ CSV:
 library(readr)
 df <- read_csv("~/Downloads/articles_dataset_2024-01-01_2024-01-31.csv")
 ```
+
+## Merge Multiple Parquet Chunks
+
+If you split scraping into several date windows, merge outputs in chronological order:
+
+```bash
+uv run parquet_merge.py --input-dir ~/Downloads --output ~/Downloads/articles_dataset_merged.parquet
+```
+
+Optional: keep provenance columns (`source_file`, `source_order`):
+
+```bash
+uv run parquet_merge.py --input-dir ~/Downloads --add-source
+```
