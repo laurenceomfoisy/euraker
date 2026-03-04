@@ -1,0 +1,26 @@
+Eureka Probe Summary
+====================
+Current URL: https://nouveau-eureka-cc.acces.bibl.ulaval.ca/Search/ResultMobile
+Performance entries: 3040
+Candidate endpoints: 23
+
+Best DOM contexts (top 5)
+- frame_path=[] keys_html=1000 keys_links=1930 max=1930 estimated_total=3
+- frame_path=[0] keys_html=0 keys_links=0 max=0 estimated_total=None
+
+Candidate endpoints (top 15)
+- https://nouveau-eureka-cc.acces.bibl.ulaval.ca/Criteria/CriteriaExpResult | reqs=5 | types=['XHR'] | statuses=[200]
+- https://nouveau-eureka-cc.acces.bibl.ulaval.ca/Search/SyncIsAplim | reqs=2 | types=['XHR'] | statuses=[200]
+- https://nouveau-eureka-cc.acces.bibl.ulaval.ca/Search/SetSourcesForm?selectedForm=2 | reqs=1 | types=['XHR'] | statuses=[200]
+- https://nouveau-eureka-cc.acces.bibl.ulaval.ca/Search/GetPage?pageNo=0&docPerPage=50 | reqs=1 | types=['XHR'] | statuses=[200]
+- https://nouveau-eureka-cc.acces.bibl.ulaval.ca/Search/GetPage?pageNo=1&docPerPage=50 | reqs=1 | types=['XHR'] | statuses=[200]
+- https://nouveau-eureka-cc.acces.bibl.ulaval.ca/Search/GetPage?pageNo=2&docPerPage=50 | reqs=1 | types=['XHR'] | statuses=[200]
+- https://nouveau-eureka-cc.acces.bibl.ulaval.ca/Search/GetPage?pageNo=3&docPerPage=50 | reqs=1 | types=['XHR'] | statuses=[200]
+- https://nouveau-eureka-cc.acces.bibl.ulaval.ca/Search/GetPage?pageNo=4&docPerPage=50 | reqs=1 | types=['XHR'] | statuses=[200]
+- https://nouveau-eureka-cc.acces.bibl.ulaval.ca/Search/GetPage?pageNo=5&docPerPage=50 | reqs=1 | types=['XHR'] | statuses=[200]
+- https://nouveau-eureka-cc.acces.bibl.ulaval.ca/Search/GetPage?pageNo=6&docPerPage=50 | reqs=1 | types=['XHR'] | statuses=[200]
+- https://nouveau-eureka-cc.acces.bibl.ulaval.ca/Search/GetPage?pageNo=7&docPerPage=50 | reqs=1 | types=['XHR'] | statuses=[200]
+- https://nouveau-eureka-cc.acces.bibl.ulaval.ca/Search/GetPage?pageNo=8&docPerPage=50 | reqs=1 | types=['XHR'] | statuses=[200]
+- https://nouveau-eureka-cc.acces.bibl.ulaval.ca/Search/GetPage?pageNo=9&docPerPage=50 | reqs=1 | types=['XHR'] | statuses=[200]
+- https://nouveau-eureka-cc.acces.bibl.ulaval.ca/Search/GetPage?pageNo=10&docPerPage=50 | reqs=1 | types=['XHR'] | statuses=[200]
+- https://nouveau-eureka-cc.acces.bibl.ulaval.ca/Search/GetPage?pageNo=11&docPerPage=50 | reqs=1 | types=['XHR'] | statuses=[200]

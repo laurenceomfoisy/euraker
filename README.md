@@ -54,6 +54,12 @@ Faster parallel mode (recommended for bigger downloads):
 uv run euraker --start-date 2024-01-01 --end-date 2024-01-31 --mode requests --workers 8 --yes
 ```
 
+Human-in-the-loop full-coverage mode (iterative backfill + dedupe):
+
+```bash
+uv run euraker --start-date 2022-11-30 --end-date 2026-03-04 --mode requests --workers 10 --yes --auto-backfill --target-total 7387
+```
+
 Or run the module file directly:
 
 ```bash
@@ -80,6 +86,8 @@ uv run python eureka_scraper.py --start-date 2024-01-01 --end-date 2024-01-31
 - `--mode {auto,selenium,requests}` choose downloader strategy
 - `--workers N` number of parallel workers in requests mode
 - `--interactive` launch guided setup wizard
+- `--auto-backfill` iteratively collect keys across multiple manual date-window searches
+- `--target-total N` expected total keys in backfill mode (stops when reached)
 - `--export-format {parquet,csv,jsonl}` dataset output format (default: `parquet`)
 - `--export-dir PATH` final dataset destination (default: `~/Downloads`)
 
@@ -146,6 +154,16 @@ uv run euraker --start-date 2024-01-01 --end-date 2024-01-31 --start-index 500
 - If login fails, verify institutional access is active in your browser session.
 - If document keys are not found, ensure you are on the Eureka results page before pressing Enter.
 - If Chrome startup fails, update Chrome and re-run `uv sync`.
+
+### Probe Infinite-Scroll Networking
+
+If you need to diagnose why only part of a large result set is extracted, run:
+
+```bash
+uv run python eureka_probe.py
+```
+
+It captures network/performance events while you manually scroll in Eureka and writes reports to `./probe_reports/`.
 
 ## Security and Data Handling
 

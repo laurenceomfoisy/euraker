@@ -16,6 +16,7 @@
 
 import argparse
 import concurrent.futures
+from datetime import datetime, timedelta
 import html as html_lib
 import json
 import os
@@ -64,6 +65,8 @@ class EurekaScraper:
         """
         self.output_dir = str(Path(output_dir).expanduser().resolve())
         self.driver = None
+        self.last_get_page_stats = None
+        self.date_hint_bounds = None
 
         # Create output directory if it doesn't exist
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
@@ -264,6 +267,39 @@ class EurekaScraper:
             keys.append(unquote(match.group(1)))
         return keys
 
+    def _extract_doc_keys_from_get_page_payload(self, payload):
+        """Extract article doc keys from Search/GetPage HTML payload only."""
+        keys = []
+        seen = set()
+
+        try:
+            soup = BeautifulSoup(payload, "html.parser")
+            for link in soup.select("a[href*='docName=']"):
+                href = link.get("href") or ""
+                match = re.search(r"docName=([^&\"'\s>]+)", href)
+                if not match:
+                    continue
+                key = unquote(match.group(1))
+                if key in seen:
+                    continue
+                seen.add(key)
+                keys.append(key)
+        except Exception:
+            pass
+
+        if keys:
+            return keys
+
+        # Conservative fallback when markup selectors miss links.
+        for match in re.finditer(r"docName=([^&\"'\s>]+)", payload):
+            key = unquote(match.group(1))
+            if key in seen:
+                continue
+            seen.add(key)
+            keys.append(key)
+
+        return keys
+
     def _switch_to_frame_path(self, frame_path):
         """Switch Selenium context to a nested frame path."""
         try:
@@ -366,6 +402,7 @@ class EurekaScraper:
         seen = set()
         page_number = 1
         active_frame_path = None
+        no_growth_rounds = 0
 
         while page_number <= max_pages:
             frame_path, page_keys = self._extract_doc_keys_best_context()
@@ -386,15 +423,45 @@ class EurekaScraper:
                 f"Results page {page_number}: found {len(page_keys)} keys ({new_keys} new, {len(collected)} total)"
             )
 
+            if page_number == 1 and len(collected) >= 1000:
+                print(
+                    "Reached 1000 keys on first loaded results view; skipping slow UI pagination checks."
+                )
+                break
+
+            if new_keys == 0:
+                no_growth_rounds += 1
+            else:
+                no_growth_rounds = 0
+
+            if no_growth_rounds >= 2 and len(collected) >= 1000:
+                print(
+                    "Result navigation produced no new keys repeatedly; stopping UI traversal and switching to API fallback."
+                )
+                break
+
             next_button = self._find_next_results_button()
             if not next_button:
                 if page_number == 1 and len(collected) >= 1000:
                     print(
                         "No next-page control detected after 1000 keys. Eureka may be capping this query at 1000 results."
                     )
-                    print(
-                        "Try a narrower date window (e.g., weekly/monthly chunks) and run multiple scrapes."
+                    print("Switching to fallback strategies...")
+                    extra_keys = self._collect_doc_keys_infinite_scroll(
+                        seen_keys=seen,
+                        active_frame_path=active_frame_path,
+                        max_scroll_steps=40,
+                        stable_rounds=5,
                     )
+                    for key in extra_keys:
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        collected.append(key)
+                    if extra_keys:
+                        print(
+                            f"Infinite scroll recovery added {len(extra_keys)} keys ({len(collected)} total)."
+                        )
                 break
 
             previous_page_source = self.driver.page_source
@@ -426,6 +493,405 @@ class EurekaScraper:
 
         return collected
 
+    def _collect_doc_keys_infinite_scroll(
+        self,
+        seen_keys=None,
+        active_frame_path=None,
+        max_scroll_steps=400,
+        stable_rounds=8,
+    ):
+        """Collect additional keys by driving infinite scroll in the results view."""
+        if seen_keys is None:
+            seen_keys = set()
+
+        if active_frame_path is not None:
+            self._switch_to_frame_path(active_frame_path)
+
+        added = []
+        idle_rounds = 0
+
+        for step in range(1, max_scroll_steps + 1):
+            page_source = self.driver.page_source
+            page_keys = self._extract_doc_keys_from_html(page_source)
+            if not page_keys:
+                page_keys = self._extract_doc_keys_from_links()
+
+            new_this_step = 0
+            for key in page_keys:
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                added.append(key)
+                new_this_step += 1
+
+            if new_this_step == 0:
+                idle_rounds += 1
+            else:
+                idle_rounds = 0
+
+            print(
+                f"Infinite scroll step {step}: {new_this_step} new keys ({len(added)} added)"
+            )
+
+            if idle_rounds >= stable_rounds:
+                print(
+                    f"Infinite scroll stabilized after {stable_rounds} idle steps; stopping."
+                )
+                break
+
+            scroll_result = self.driver.execute_script(
+                """
+                const all = [document.scrollingElement, ...Array.from(document.querySelectorAll('main,section,div,ul,article'))];
+                let target = null;
+                let bestDelta = 0;
+                for (const el of all) {
+                    if (!el) continue;
+                    const delta = (el.scrollHeight || 0) - (el.clientHeight || 0);
+                    if (delta > bestDelta) {
+                        bestDelta = delta;
+                        target = el;
+                    }
+                }
+                if (!target) {
+                    return {moved: false, before: 0, after: 0, delta: 0};
+                }
+                const before = target.scrollTop || 0;
+                const increment = Math.max(200, Math.floor((target.clientHeight || 800) * 0.9));
+                target.scrollTop = before + increment;
+                const after = target.scrollTop || 0;
+                return {moved: after > before, before, after, delta: bestDelta};
+                """
+            )
+
+            if not scroll_result.get("moved"):
+                self.driver.execute_script(
+                    "window.scrollBy(0, Math.max(400, Math.floor(window.innerHeight * 0.9)));"
+                )
+
+            time.sleep(1.0)
+
+        return added
+
+    def _extract_doc_keys_via_get_page(
+        self,
+        target_total=None,
+        doc_per_page=50,
+        max_pages=500,
+        selected_form=None,
+    ):
+        """Fetch result pages directly from Eureka's Search/GetPage endpoint."""
+        current_url = self.driver.current_url
+        base_match = re.match(r"^(https?://[^/]+)", current_url or "")
+        if not base_match:
+            return []
+
+        base_url = base_match.group(1)
+        endpoint = f"{base_url}/Search/GetPage"
+        set_form_endpoint = f"{base_url}/Search/SetSourcesForm"
+        cookies = {
+            cookie["name"]: cookie["value"] for cookie in self.driver.get_cookies()
+        }
+        user_agent = self.driver.execute_script("return navigator.userAgent;")
+        headers = {
+            "User-Agent": user_agent,
+            "Referer": current_url,
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+        print("Trying direct Search/GetPage key extraction...")
+
+        if selected_form is not None:
+            try:
+                set_response = requests.get(
+                    set_form_endpoint,
+                    params={"selectedForm": selected_form},
+                    headers=headers,
+                    cookies=cookies,
+                    timeout=30,
+                )
+                set_response.raise_for_status()
+                print(f"SetSourcesForm selectedForm={selected_form}: ok")
+            except Exception as e:
+                print(f"SetSourcesForm selectedForm={selected_form} failed: {e}")
+                return []
+
+            self._refresh_result_context(base_url, headers, cookies)
+
+        collected = []
+        seen = set()
+        empty_pages = 0
+        page_count = 0
+        window_dates = set()
+
+        for page_no in range(max_pages):
+            try:
+                response = requests.get(
+                    endpoint,
+                    params={"pageNo": page_no, "docPerPage": doc_per_page},
+                    headers=headers,
+                    cookies=cookies,
+                    timeout=45,
+                )
+                response.raise_for_status()
+                payload = response.text
+            except Exception as e:
+                print(f"GetPage request failed at page {page_no}: {e}")
+                break
+
+            page_keys = self._extract_doc_keys_from_get_page_payload(payload)
+
+            new_keys = 0
+            for key in page_keys:
+                if key in seen:
+                    continue
+                seen.add(key)
+                collected.append(key)
+                new_keys += 1
+
+            for normalized_date in self._extract_dates_from_payload(payload):
+                if self._date_is_within_hint_bounds(normalized_date):
+                    window_dates.add(normalized_date)
+
+            print(
+                f"GetPage {page_no}: {len(page_keys)} keys ({new_keys} new, {len(collected)} total)"
+            )
+
+            if not page_keys:
+                empty_pages += 1
+            else:
+                empty_pages = 0
+                page_count += 1
+
+            if empty_pages >= 2:
+                break
+
+            if target_total and len(collected) >= target_total:
+                print(f"Reached target total ({target_total}) via GetPage extraction")
+                break
+
+        min_date = min(window_dates) if window_dates else None
+        max_date = max(window_dates) if window_dates else None
+        self.last_get_page_stats = {
+            "total_keys": len(collected),
+            "page_count": page_count,
+            "min_date": min_date,
+            "max_date": max_date,
+        }
+        if min_date and max_date:
+            print(f"GetPage date span observed: {min_date} to {max_date}")
+        else:
+            print("GetPage date span observed: none within active date bounds")
+
+        return collected
+
+    def _normalize_date_text(self, raw_value):
+        """Normalize common date strings to YYYY-MM-DD."""
+        value = re.sub(r"\s+", " ", (raw_value or "")).strip().lower()
+        if not value:
+            return None
+
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            return value
+
+        french_months = {
+            "janvier": "january",
+            "fevrier": "february",
+            "février": "february",
+            "mars": "march",
+            "avril": "april",
+            "mai": "may",
+            "juin": "june",
+            "juillet": "july",
+            "aout": "august",
+            "août": "august",
+            "septembre": "september",
+            "octobre": "october",
+            "novembre": "november",
+            "decembre": "december",
+            "décembre": "december",
+        }
+        for fr, en in french_months.items():
+            value = value.replace(fr, en)
+
+        value = re.sub(
+            r"\b(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\b,?",
+            "",
+            value,
+        )
+        value = re.sub(
+            r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b,?",
+            "",
+            value,
+        )
+        value = re.sub(r"\s+", " ", value).strip(" ,")
+
+        parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
+        if pd.isna(parsed):
+            parsed = pd.to_datetime(value, errors="coerce", dayfirst=False)
+        if pd.isna(parsed):
+            return None
+        return parsed.strftime("%Y-%m-%d")
+
+    def _date_is_within_hint_bounds(self, normalized_date):
+        """Return True when date is inside current backfill bounds (if set)."""
+        if not normalized_date:
+            return False
+        if not self.date_hint_bounds:
+            return True
+        lower, upper = self.date_hint_bounds
+        return lower <= normalized_date <= upper
+
+    def _extract_dates_from_payload(self, payload):
+        """Extract normalized date strings from a GetPage HTML payload."""
+        date_texts = set()
+
+        for match in re.finditer(r"\b\d{4}-\d{2}-\d{2}\b", payload):
+            date_texts.add(match.group(0))
+
+        for match in re.finditer(r"\b\d{1,2}\s+[A-Za-zÀ-ÿ]+\s+\d{4}\b", payload):
+            date_texts.add(match.group(0))
+
+        for match in re.finditer(r"\b[A-Za-zÀ-ÿ]+\s+\d{1,2},\s+\d{4}\b", payload):
+            date_texts.add(match.group(0))
+
+        normalized = []
+        for raw in date_texts:
+            value = self._normalize_date_text(raw)
+            if value:
+                normalized.append(value)
+
+        return normalized
+
+    def _refresh_result_context(self, base_url, headers, cookies):
+        """Refresh Eureka result context after changing source form."""
+        criteria_url = f"{base_url}/Criteria/CriteriaExpResult"
+        sync_url = f"{base_url}/Search/SyncIsAplim"
+
+        criteria_headers = dict(headers)
+        criteria_headers["Content-Type"] = (
+            "application/x-www-form-urlencoded; charset=UTF-8"
+        )
+
+        post_variants = [
+            {},
+            {"selectedForm": ""},
+            {"criteria": ""},
+            {"fromResult": "1"},
+        ]
+
+        refreshed = False
+        for payload in post_variants:
+            try:
+                response = requests.post(
+                    criteria_url,
+                    data=payload,
+                    headers=criteria_headers,
+                    cookies=cookies,
+                    timeout=30,
+                )
+                if response.status_code == 200:
+                    refreshed = True
+                    break
+            except Exception:
+                continue
+
+        try:
+            requests.get(sync_url, headers=headers, cookies=cookies, timeout=20)
+        except Exception:
+            pass
+
+        if refreshed:
+            print("Refreshed criteria context after source-form switch")
+
+    def _extract_doc_keys_via_all_source_forms(
+        self, target_total=None, form_candidates=None
+    ):
+        """Try multiple source forms and union keys across forms."""
+        if form_candidates is None:
+            form_candidates = list(range(0, 10))
+
+        all_keys = []
+        seen = set()
+        empty_forms_in_row = 0
+
+        print("Trying multi-form Search/GetPage extraction...")
+        for form_id in form_candidates:
+            form_keys = self._extract_doc_keys_via_get_page(
+                target_total=None,
+                selected_form=form_id,
+            )
+
+            new_in_form = 0
+            for key in form_keys:
+                if key in seen:
+                    continue
+                seen.add(key)
+                all_keys.append(key)
+                new_in_form += 1
+
+            print(
+                f"Form {form_id}: {len(form_keys)} keys ({new_in_form} new, {len(all_keys)} total)"
+            )
+
+            if len(form_keys) == 0:
+                empty_forms_in_row += 1
+            else:
+                empty_forms_in_row = 0
+
+            if target_total and len(all_keys) >= target_total:
+                print(f"Reached target total ({target_total}) across forms")
+                break
+
+            if empty_forms_in_row >= 3 and form_id >= 3:
+                break
+
+        return all_keys
+
+    def _discover_source_form_candidates(self):
+        """Discover source form ids exposed by current result page markup."""
+        candidates = []
+        seen = set()
+
+        try:
+            html = self.driver.page_source
+        except Exception:
+            html = ""
+
+        for match in re.finditer(r"selectedForm\s*=\s*(\d+)", html):
+            value = int(match.group(1))
+            if value not in seen:
+                seen.add(value)
+                candidates.append(value)
+
+        for match in re.finditer(r"SetSourcesForm\?selectedForm=(\d+)", html):
+            value = int(match.group(1))
+            if value not in seen:
+                seen.add(value)
+                candidates.append(value)
+
+        try:
+            links = self.driver.find_elements(
+                By.XPATH, "//a[contains(@href, 'SetSourcesForm?selectedForm=')]"
+            )
+            for link in links:
+                href = link.get_attribute("href") or ""
+                matched = re.search(r"selectedForm=(\d+)", href)
+                if not matched:
+                    continue
+                value = int(matched.group(1))
+                if value not in seen:
+                    seen.add(value)
+                    candidates.append(value)
+        except Exception:
+            pass
+
+        if 2 not in seen:
+            candidates.append(2)
+
+        candidates = sorted(candidates)
+        print(f"Discovered source form candidates: {candidates}")
+        return candidates
+
     def estimate_total_results(self):
         """Best-effort parser for total results displayed on the results page."""
         try:
@@ -454,6 +920,123 @@ class EurekaScraper:
                 return value
 
         return None
+
+    def _collect_keys_for_current_results(self):
+        """Collect keys from the currently visible Eureka results context."""
+        estimated_total = self.estimate_total_results()
+        if estimated_total:
+            print(f"Estimated total results shown by Eureka: {estimated_total}")
+
+        doc_keys = self._extract_doc_keys_via_get_page(target_total=estimated_total)
+        if doc_keys:
+            print(f"Using {len(doc_keys)} keys collected via Search/GetPage")
+        else:
+            print("Search/GetPage did not return keys; falling back to UI extraction")
+            doc_keys = self.extract_doc_keys()
+
+        needs_multi_form = False
+        if estimated_total and len(doc_keys) < estimated_total:
+            needs_multi_form = True
+        elif not estimated_total and len(doc_keys) >= 1000:
+            needs_multi_form = True
+
+        if needs_multi_form:
+            print("Key count may still be incomplete; trying multiple source forms...")
+            form_candidates = self._discover_source_form_candidates()
+            all_form_keys = self._extract_doc_keys_via_all_source_forms(
+                target_total=estimated_total,
+                form_candidates=form_candidates,
+            )
+            if all_form_keys:
+                merged = []
+                seen = set()
+                for key in doc_keys + all_form_keys:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    merged.append(key)
+                doc_keys = merged
+                print(f"After multi-form merge: {len(doc_keys)} unique keys")
+
+        if estimated_total and len(doc_keys) < estimated_total:
+            print(
+                f"Warning: extracted {len(doc_keys)} keys but results page indicates about {estimated_total}."
+            )
+
+        return doc_keys
+
+    def _collect_keys_with_manual_backfill(self, target_total=None, max_rounds=20):
+        """Iteratively collect keys while user adjusts date windows in Eureka."""
+        all_keys = []
+        seen = set()
+        rounds_without_new = 0
+
+        for round_idx in range(1, max_rounds + 1):
+            print(f"\nBackfill round {round_idx}/{max_rounds}")
+            round_keys = self._collect_keys_for_current_results()
+
+            new_in_round = 0
+            for key in round_keys:
+                if key in seen:
+                    continue
+                seen.add(key)
+                all_keys.append(key)
+                new_in_round += 1
+
+            print(
+                f"Backfill progress: +{new_in_round} new keys, {len(all_keys)} total unique keys"
+            )
+
+            oldest_date = None
+            if self.last_get_page_stats:
+                oldest_date = self.last_get_page_stats.get("min_date")
+            if oldest_date:
+                try:
+                    suggested_end = (
+                        datetime.strptime(oldest_date, "%Y-%m-%d") - timedelta(days=1)
+                    ).strftime("%Y-%m-%d")
+                    print(
+                        f"Oldest observed date this round: {oldest_date}. Suggested next end-date: {suggested_end}"
+                    )
+                except Exception:
+                    print(f"Oldest observed date this round: {oldest_date}")
+
+            with open(
+                os.path.join(self.output_dir, "doc_keys.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(all_keys, f, indent=2)
+
+            if target_total and len(all_keys) >= target_total:
+                print(f"Reached target total ({target_total}) keys.")
+                break
+
+            if new_in_round == 0:
+                rounds_without_new += 1
+            else:
+                rounds_without_new = 0
+
+            if rounds_without_new >= 2:
+                print("No new keys found in two consecutive rounds; stopping backfill.")
+                break
+
+            print("\nManual step required for next backfill round")
+            print("1) In browser, keep the same query/filters")
+            print("2) Move date range further back in time")
+            print("3) Run search and stay on the results page")
+            user_value = (
+                input(
+                    "Press Enter for next round, or type 'q' to stop key collection: "
+                )
+                .strip()
+                .lower()
+            )
+            if user_value in {"q", "quit", "stop"}:
+                print("Stopping backfill as requested.")
+                break
+
+        return all_keys
 
     def load_saved_doc_keys(self):
         """Load previously extracted document keys, if available."""
@@ -1139,6 +1722,10 @@ class EurekaScraper:
         assume_yes=False,
         mode="auto",
         workers=1,
+        auto_backfill=False,
+        target_total=None,
+        hint_start_date=None,
+        hint_end_date=None,
     ):
         """
         Run the complete scraping process with manual login and search.
@@ -1169,11 +1756,18 @@ class EurekaScraper:
             # User has manually done the search, now we wait for the results
             self.wait_for_search_results()
 
-            # Extract document keys
-            doc_keys = self.extract_doc_keys()
-            estimated_total = self.estimate_total_results()
-            if estimated_total:
-                print(f"Estimated total results shown by Eureka: {estimated_total}")
+            if hint_start_date and hint_end_date:
+                self.date_hint_bounds = (hint_start_date, hint_end_date)
+            else:
+                self.date_hint_bounds = None
+
+            if auto_backfill:
+                doc_keys = self._collect_keys_with_manual_backfill(
+                    target_total=target_total,
+                )
+            else:
+                doc_keys = self._collect_keys_for_current_results()
+
             if not doc_keys:
                 if start_index > 0:
                     print(
@@ -1189,17 +1783,6 @@ class EurekaScraper:
                         "Make sure you are on the Eureka search results list (not an article page) before pressing Enter."
                     )
                     return
-
-            if estimated_total and len(doc_keys) < estimated_total:
-                print(
-                    f"Warning: extracted {len(doc_keys)} keys but results page indicates about {estimated_total} items."
-                )
-                print(
-                    "This usually means Eureka applies a 1000-item retrieval cap per query."
-                )
-                print(
-                    "Recommended: split your search into smaller date windows (for example weekly/monthly) so each query returns < 1000 results."
-                )
 
             # Create URLs for articles
             urls = self.create_article_urls(doc_keys)
@@ -1420,6 +2003,19 @@ def run_interactive_wizard(args):
         max_value=20000,
     )
 
+    auto_backfill = prompt_yes_no(
+        "Auto-backfill keys across multiple manual date windows",
+        default=args.auto_backfill,
+    )
+    target_total = args.target_total
+    if auto_backfill:
+        target_total = prompt_int(
+            "Target total keys (set your Eureka total)",
+            default=args.target_total if args.target_total else 7387,
+            min_value=1,
+            max_value=200000,
+        )
+
     print("\nDataset export format options:")
     print("1) parquet (recommended, compact and fast in R with arrow)")
     print("2) csv (human-readable, larger files)")
@@ -1454,6 +2050,8 @@ def run_interactive_wizard(args):
     print(f"- mode: {mode}")
     print(f"- workers: {workers}")
     print(f"- batch_size: {batch_size}")
+    print(f"- auto_backfill: {auto_backfill}")
+    print(f"- target_total: {target_total}")
     print(f"- export_format: {export_format}")
     print(f"- export_dir: {export_dir}")
     print("- cleanup_temp_files: enabled")
@@ -1471,6 +2069,8 @@ def run_interactive_wizard(args):
         "assume_yes": assume_yes,
         "mode": mode,
         "workers": workers,
+        "auto_backfill": auto_backfill,
+        "target_total": target_total,
         "export_format": export_format,
         "export_dir": export_dir,
     }
@@ -1486,6 +2086,8 @@ def main(
     assume_yes=False,
     mode="auto",
     workers=1,
+    auto_backfill=False,
+    target_total=None,
     export_format="parquet",
     export_dir=DEFAULT_EXPORT_DIR,
 ):
@@ -1568,6 +2170,10 @@ def main(
         assume_yes=assume_yes,
         mode=mode,
         workers=workers,
+        auto_backfill=auto_backfill,
+        target_total=target_total,
+        hint_start_date=start_date,
+        hint_end_date=end_date,
     )
     exported_path = scraper.export_articles_dataset(
         export_format=export_format,
@@ -1644,6 +2250,17 @@ def build_parser():
         help="Launch interactive setup wizard before running",
     )
     parser.add_argument(
+        "--auto-backfill",
+        action="store_true",
+        help="Iteratively collect keys across multiple manual date-window searches",
+    )
+    parser.add_argument(
+        "--target-total",
+        type=int,
+        default=None,
+        help="Expected total keys to collect when using --auto-backfill",
+    )
+    parser.add_argument(
         "--export-format",
         choices=["parquet", "csv", "jsonl"],
         default="parquet",
@@ -1677,6 +2294,8 @@ def cli():
             "assume_yes": args.yes,
             "mode": args.mode,
             "workers": max(1, args.workers),
+            "auto_backfill": args.auto_backfill,
+            "target_total": args.target_total,
             "export_format": args.export_format,
             "export_dir": args.export_dir,
         }
